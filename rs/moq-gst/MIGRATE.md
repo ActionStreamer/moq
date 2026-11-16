@@ -4,6 +4,10 @@ How to update your pipelines for each breaking change, newest first.
 
 ## Unreleased
 
+### `moqsrc` exposes publisher capture time
+
+Buffers from the catalog's own tracks carry `GstReferenceTimestampMeta` in the `timestamp/x-unix` domain when the catalog provides a media clock. Pipelines can use this metadata to correlate media PTS with capture time; buffers from catalogs without a clock and externally referenced broadcasts do not carry it.
+
 ### `moqsrc` audio caps are the standard ones
 
 `moqsrc` audio pads now carry `rate` and `channels` as `int`, and Opus pads the mapping fields (`channel-mapping-family`, `stream-count`, `coupled-count`, plus `channel-mapping` beyond stereo) with the OpusHead and an empty OpusTags as `streamheader`, so `decodebin` and `opusdec` accept them and `opusdec` applies the output gain.

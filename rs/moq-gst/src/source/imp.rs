@@ -14,6 +14,8 @@ use hang::moq_net;
 static CAT: LazyLock<gst::DebugCategory> =
 	LazyLock::new(|| gst::DebugCategory::new("moq-src", gst::DebugColorFlags::empty(), Some("MoQ Source Element")));
 
+static UNIX_TIMESTAMP_CAPS: LazyLock<gst::Caps> = LazyLock::new(|| gst::Caps::new_empty_simple("timestamp/x-unix"));
+
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
@@ -421,6 +423,7 @@ struct Shape {
 	track: String,
 	broadcast: Option<moq_net::path::Relative>,
 	instance: Option<moq_net::Instance>,
+	clock: Option<hang::catalog::Clock>,
 }
 
 /// A rendition by kind and moq track name: what a pad is kept by.
@@ -1068,6 +1071,11 @@ fn reconcile(
 				track: reference.track(name).to_string(),
 				broadcast: reference.broadcast().cloned(),
 				instance: reference.instance().cloned(),
+				clock: if reference.broadcast().is_none() {
+					catalog.media.clock
+				} else {
+					None
+				},
 			};
 			desired.insert((kind, name.clone()), shape);
 		}
@@ -1739,7 +1747,7 @@ impl Play {
 				frame = track.read() => match frame {
 					Ok(Some(moq_mux::container::Read::Gap { .. } | moq_mux::container::Read::End { .. })) => {}
 					Ok(Some(moq_mux::container::Read::Frame { frame, .. })) => {
-						let mut buffer = match build_buffer(frame, kind) {
+						let mut buffer = match build_buffer(frame, kind, shape.clock) {
 							Ok(buffer) => buffer,
 							Err(err) => {
 								if let Some(obj) = element.upgrade() {
@@ -1883,13 +1891,30 @@ fn begin(pad: &gst::Pad, name: &str, caps: &gst::Caps) {
 }
 
 /// Preserve the broadcast timestamp at the common nanosecond scale used by GStreamer.
-fn build_buffer(frame: moq_mux::container::Frame, kind: TrackKind) -> Result<gst::Buffer> {
+fn build_buffer(
+	frame: moq_mux::container::Frame,
+	kind: TrackKind,
+	clock: Option<hang::catalog::Clock>,
+) -> Result<gst::Buffer> {
+	let reference = clock.map(|clock| clock.wall_clock(frame.timestamp)).transpose()?;
 	let mut buffer = gst::Buffer::from_slice(frame.payload);
 	let buffer_mut = buffer.get_mut().unwrap();
 
 	let pts =
 		gst::ClockTime::try_from(Duration::from(frame.timestamp)).context("timestamp exceeds GStreamer clock range")?;
 	buffer_mut.set_pts(Some(pts));
+	if let Some(reference) = reference {
+		let unix = reference
+			.checked_duration_since(kio::clock::Wall::UNIX_EPOCH)
+			.context("capture time precedes Unix epoch")?;
+		let timestamp = gst::ClockTime::try_from(unix).context("capture time exceeds GStreamer clock range")?;
+		gst::ReferenceTimestampMeta::add(
+			buffer_mut,
+			&UNIX_TIMESTAMP_CAPS,
+			timestamp,
+			None,
+		);
+	}
 
 	let mut flags = buffer_mut.flags();
 	match kind {
@@ -2318,7 +2343,31 @@ mod tests {
 			keyframe: true,
 			duration: None,
 		};
-		assert!(super::build_buffer(frame, super::TrackKind::Video).is_err());
+		assert!(super::build_buffer(frame, super::TrackKind::Video, None).is_err());
+	}
+
+	#[test]
+	fn buffers_expose_publisher_capture_time_without_rebasing() {
+		gst::init().unwrap();
+		let frame = moq_mux::container::Frame {
+			timestamp: Timestamp::from_millis(8_000).unwrap(),
+			payload: bytes::Bytes::new(),
+			keyframe: true,
+			duration: None,
+		};
+		let clock = hang::catalog::Clock::new(Timestamp::from_millis(1_000_000).unwrap()).unwrap();
+		let buffer = super::build_buffer(frame.clone(), super::TrackKind::Video, Some(clock)).unwrap();
+		let meta = buffer.iter_meta::<gst::ReferenceTimestampMeta>().next().unwrap();
+		assert_eq!(meta.reference().structure(0).unwrap().name(), "timestamp/x-unix");
+		assert_eq!(meta.timestamp(), gst::ClockTime::from_seconds(1_577_837_808));
+		assert_eq!(buffer.pts(), Some(gst::ClockTime::from_seconds(8)));
+		let without_clock = super::build_buffer(frame, super::TrackKind::Video, None).unwrap();
+		assert!(
+			without_clock
+				.iter_meta::<gst::ReferenceTimestampMeta>()
+				.next()
+				.is_none()
+		);
 	}
 }
 
@@ -2486,6 +2535,59 @@ mod session_tests {
 		let mut config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		config.container = Container::Legacy;
 		config
+	}
+
+	#[test]
+	fn catalog_clock_reaches_subscriber_buffer_as_unix_reference() {
+		let _pad_ids = pad_ids();
+		let element = element();
+		let (sender, receiver) = std::sync::mpsc::channel();
+		element.connect_pad_added(move |_, pad| {
+			let sender = sender.clone();
+			pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+				if let Some(buffer) = info.buffer() {
+					let timestamp = buffer
+						.iter_meta::<gst::ReferenceTimestampMeta>()
+						.next()
+						.map(|meta| meta.timestamp());
+					sender.send(timestamp).unwrap();
+					return gst::PadProbeReturn::Drop;
+				}
+				gst::PadProbeReturn::Ok
+			});
+		});
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let mut video = VideoConfig::new(VideoCodec::VP8);
+		video.coded_width = Some(16);
+		video.coded_height = Some(16);
+		let track = broadcast.create_track("video", hang::container::track_info(0)).unwrap();
+		let mut producer = moq_mux::container::Producer::new(
+			track,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Video),
+		);
+		{
+			let mut catalog = catalog.modify().unwrap();
+			catalog.media.clock =
+				Some(hang::catalog::Clock::new(moq_net::Timestamp::from_millis(1_000_000).unwrap()).unwrap());
+			catalog.video.renditions.insert("video".into(), video);
+		}
+		let (shutdown, receiver_shutdown) = watch::channel(false);
+		let task = run(broadcast.consume(), element.downgrade(), receiver_shutdown);
+		producer
+			.write(moq_mux::container::Frame {
+				timestamp: moq_net::Timestamp::from_millis(8_000).unwrap(),
+				payload: bytes::Bytes::from_static(&[0]),
+				keyframe: true,
+				duration: None,
+			})
+			.unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+			Some(gst::ClockTime::from_seconds(1_577_837_808))
+		);
+		shutdown.send(true).unwrap();
+		super::RUNTIME.block_on(task).unwrap().unwrap();
 	}
 
 	/// Real wire consumers and source pads, with each write acknowledged by a pad probe.
@@ -3699,6 +3801,7 @@ mod session_tests {
 				track: "video".into(),
 				broadcast: None,
 				instance: None,
+				clock: None,
 			},
 			instance,
 			serial: 1,
